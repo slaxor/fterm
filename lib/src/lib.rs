@@ -1,7 +1,9 @@
 //! fterm core: serial terminal for Forth targets with flow-controlled uploads and host Forth macros.
 
+pub mod config;
 pub mod link;
 pub mod source;
+pub mod vm;
 
 /// Returns a greeting for `name`.
 pub fn greet(name: &str) -> String {
