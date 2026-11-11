@@ -1,0 +1,12 @@
+[package]
+name = "fterm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fterm"
+path = "src/main.rs"
+
+[dependencies]
+fterm = { path = "../lib" }
