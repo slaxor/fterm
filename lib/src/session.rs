@@ -37,8 +37,16 @@ ctrl-t h  this help
 ctrl-t <c> / F1..F12  bound macros (bind in .fterm.fs)
 line editing: up/down ctrl-r ctrl-a/e/k/u/w/y alt-b/f
 after Enter keys go raw to the target until it prompts
-ctrl-c during an upload aborts it
+ctrl-c/Esc during an upload aborts it; while the target runs a line they
+are forwarded, and without a prompt within 0.5 s you get the editor back
 #i file  #r file  #e [file]  #f forth";
+
+const GIVE_UP: Duration = Duration::from_millis(500);
+
+/// ctrl-c or Esc: aborts scripts, and stops waiting for a busy target.
+fn is_interrupt(k: &KeyEvent) -> bool {
+    keys::is_ctrl(k, 'c') || k.code == KeyCode::Esc
+}
 
 /// A `#` line typed at the start of a line.
 #[derive(Debug, PartialEq)]
@@ -140,7 +148,7 @@ impl Target for Live<'_> {
                     show(self.out, &b);
                     return Ok(b);
                 }
-                Ok(Ev::Key(k)) if keys::is_ctrl(&k, 'c') => bail!("aborted"),
+                Ok(Ev::Key(k)) if is_interrupt(&k) => bail!("aborted"),
                 Ok(Ev::Lost(e)) => {
                     *self.port = None;
                     bail!("disconnected: {e}");
@@ -155,6 +163,11 @@ impl Target for Live<'_> {
 
     fn emit(&mut self, text: &str) {
         show(self.out, text.as_bytes());
+    }
+
+    fn control(&mut self, line: crate::link::Control, on: bool) -> Result<()> {
+        let p = self.port.as_mut().context("not connected")?;
+        crate::link::set_control(p.as_mut(), line, on)
     }
 }
 
@@ -172,6 +185,7 @@ pub struct Session {
     ed: Editor,
     hist: History,
     watch: Vec<u8>,
+    give_up: Option<Instant>,
     later: VecDeque<Ev>,
     next_try: Instant,
     last_open_err: Option<String>,
@@ -200,6 +214,7 @@ pub fn run(vm: Vm, sock: &Path) -> Result<()> {
         ed: Editor::default(),
         hist,
         watch: Vec::new(),
+        give_up: None,
         later: VecDeque::new(),
         next_try: Instant::now(),
         last_open_err: None,
@@ -221,11 +236,12 @@ impl Session {
     fn main_loop(&mut self) -> Result<()> {
         while !self.vm.quit {
             self.reconnect();
+            self.check_give_up();
             if let Some(ev) = self.later.pop_front() {
                 self.handle(ev);
                 continue;
             }
-            match self.rx.recv_timeout(Duration::from_millis(200)) {
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ev::Fatal(e)) => bail!(e),
                 Ok(ev) => self.handle(ev),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -411,7 +427,22 @@ impl Session {
                 if let Some(b) = keys::key_bytes(&k) {
                     self.write(&b);
                 }
+                if self.mode == Mode::Busy && is_interrupt(&k) {
+                    self.give_up = Some(Instant::now() + GIVE_UP);
+                }
             }
+        }
+    }
+
+    fn check_give_up(&mut self) {
+        let due = self.give_up.is_some_and(|d| Instant::now() >= d);
+        if !due {
+            return;
+        }
+        self.give_up = None;
+        if self.mode == Mode::Busy {
+            self.mode = Mode::Edit;
+            self.note("no prompt after interrupt, back to line editing (target may still run)");
         }
     }
 

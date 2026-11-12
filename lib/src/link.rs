@@ -15,6 +15,27 @@ pub trait Target {
     fn read(&mut self, deadline: Instant) -> Result<Vec<u8>>;
     /// Prints text locally, never sent to the target.
     fn emit(&mut self, text: &str);
+    /// Sets a modem control line (DTR or RTS), e.g. to reset the target.
+    fn control(&mut self, line: Control, on: bool) -> Result<()> {
+        let _ = (line, on);
+        bail!("no serial port to set modem lines on")
+    }
+}
+
+/// Modem control lines settable with [`Target::control`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Dtr,
+    Rts,
+}
+
+/// Sets `line` on a serial port.
+pub fn set_control(port: &mut dyn serialport::SerialPort, line: Control, on: bool) -> Result<()> {
+    match line {
+        Control::Dtr => port.write_data_terminal_ready(on)?,
+        Control::Rts => port.write_request_to_send(on)?,
+    }
+    Ok(())
 }
 
 /// Prompt and error patterns plus timing for line-by-line sending.

@@ -73,7 +73,7 @@ After Enter, keys go raw to the target until it prompts with `ok.` (or reports a
 | `ctrl-t h` | help |
 | `ctrl-t ctrl-t` | send a literal ctrl-t |
 | `ctrl-t <c>`, `F1`..`F12` | macros bound with `bind` |
-| `ctrl-c` | abort a running upload or macro |
+| `ctrl-c`, `Esc` | abort a running upload or macro; while the target runs a line they are forwarded, and if no `ok.` follows within 0.5 s you get the line editor back |
 
 A single-line paste goes into the line editor. A multi-line paste goes through the upload path, with flow control.
 
@@ -111,6 +111,7 @@ Host words on top of a small core Forth (stack, arithmetic, `if else then`, `beg
 | `send` | `( a u -- )` | send a line, wait for `ok.`, throw on error |
 | `run` | `( a u -- )` | send a line, don't wait (for words that loop) |
 | `raw` | `( a u -- )` | send bytes as they are |
+| `dtr` / `rts` | `( f -- )` | set a modem line, e.g. a hard reset if RUN is wired to DTR: `: kill 0 dtr 100 delay -1 dtr ;` |
 | `upload` | `( a u -- )` | upload a file |
 | `upload?` | `( a u -- )` | upload a file if it exists, otherwise do nothing |
 | `exists` | `( a u -- f )` | true if the file exists (working dir, then config dir) |

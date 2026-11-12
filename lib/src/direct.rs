@@ -69,4 +69,8 @@ impl Target for Direct {
     fn emit(&mut self, text: &str) {
         print!("{text}");
     }
+
+    fn control(&mut self, line: crate::link::Control, on: bool) -> Result<()> {
+        crate::link::set_control(self.port.as_mut(), line, on)
+    }
 }

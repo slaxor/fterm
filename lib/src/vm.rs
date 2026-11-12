@@ -45,7 +45,7 @@ enum Prim {
     Fetch, Store, CFetch, CStore, PlusStore, Here, Allot, Comma, Cells,
     ToR, RFrom, RFetch, I, J, Execute,
     Dot, Emit, Cr, Space, Type, Words,
-    Send, Run, Raw, Upload, UploadIf, Exists, Expect, Delay, Included,
+    Send, Run, Raw, Dtr, Rts, Upload, UploadIf, Exists, Expect, Delay, Included,
     Port, Baud, Eol, Prompt, Error, NoErrors, Timeout, AddPath, HistFile, Forget, Bye,
 }
 
@@ -64,7 +64,7 @@ const PRIMS: &[(&str, Prim)] = {
         ("here", Here), ("allot", Allot), (",", Comma), ("cells", Cells),
         (">r", ToR), ("r>", RFrom), ("r@", RFetch), ("i", I), ("j", J), ("execute", Execute),
         (".", Dot), ("emit", Emit), ("cr", Cr), ("space", Space), ("type", Type), ("words", Words),
-        ("send", Send), ("run", Run), ("raw", Raw), ("upload", Upload), ("upload?", UploadIf), ("exists", Exists), ("expect", Expect), ("delay", Delay),
+        ("send", Send), ("run", Run), ("raw", Raw), ("dtr", Dtr), ("rts", Rts), ("upload", Upload), ("upload?", UploadIf), ("exists", Exists), ("expect", Expect), ("delay", Delay),
         ("included", Included),
         ("port", Port), ("baud", Baud), ("eol", Eol), ("prompt", Prompt), ("error", Error),
         ("no-errors", NoErrors), ("timeout", Timeout), ("path", AddPath), ("history", HistFile),
@@ -778,6 +778,8 @@ impl Vm {
             Run => { let mut b = self.pop_str()?.into_bytes(); b.extend_from_slice(&self.settings.proto.eol); self.tail.clear(); t.write(&b)? }
             Raw => { let s = self.pop_str()?; self.tail.clear(); t.write(s.as_bytes())? }
             Upload => { let s = self.pop_str()?; self.upload_file(Path::new(&s), t)?; }
+            Dtr => { let on = self.pop()? != 0; t.control(link::Control::Dtr, on)? }
+            Rts => { let on = self.pop()? != 0; t.control(link::Control::Rts, on)? }
             UploadIf => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); if p.is_file() { self.upload_file(&p, t)?; } }
             Exists => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); self.push(flag(p.is_file())) }
             Expect => { let ms = self.pop()?; let s = self.pop_str()?; let tail = std::mem::take(&mut self.tail); let ok = tail.contains(&s) || link::expect(t, &s, millis(ms)?)?; self.push(flag(ok)) }
@@ -1073,6 +1075,14 @@ mod tests {
             .unwrap()
             .contains("more.fs:1"));
         assert!(vm.eval("include nope.fs", &mut t).is_err());
+    }
+
+    #[test]
+    fn modem_lines_need_a_port() {
+        let mut vm = Vm::new();
+        let err = vm.eval("0 dtr", &mut Mecrisp::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("modem lines"), "{err:#}");
+        assert!(vm.eval("-1 rts", &mut Mecrisp::default()).is_err());
     }
 
     #[test]
