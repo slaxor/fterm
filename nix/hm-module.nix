@@ -21,8 +21,8 @@ in
         ' reboot bind F6
       '';
       description = ''
-        Host Forth written to ~/.config/fterm/init.fs. It is loaded before the
-        project's .fterm.fs, which can override everything set here.
+        Host Forth written to ~/.config/fterm/init.fs. Used when no project
+        .fterm.fs exists; a project config loads it with `include-global`.
       '';
     };
   };

@@ -1,6 +1,7 @@
 \ fterm host config, copy to .fterm.fs in your project root.
 \ This is host Forth: it runs inside fterm, not on the target.
 
+include-global                  \ ~/.config/fterm/init.fs, if any
 s" /dev/ttyACM0" port  115200 baud
 3000 timeout                    \ ms to wait for the prompt after each line
 s" lib" path                    \ extra #include/#require search dir

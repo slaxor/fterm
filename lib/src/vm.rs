@@ -16,6 +16,8 @@ pub struct Settings {
     pub proto: Protocol,
     pub path: Vec<PathBuf>,
     pub history: Option<PathBuf>,
+    /// The user-wide init.fs, loaded by `include-global`.
+    pub global: Option<PathBuf>,
     pub base: PathBuf,
 }
 
@@ -27,6 +29,7 @@ impl Default for Settings {
             proto: Protocol::default(),
             path: Vec::new(),
             history: crate::edit::default_history_path(),
+            global: None,
             base: PathBuf::from("."),
         }
     }
@@ -170,6 +173,7 @@ pub struct Vm {
     tail: String,
     sources: HashMap<usize, Source>,
     origin: String,
+    including: Vec<PathBuf>,
 }
 
 impl Default for Vm {
@@ -204,6 +208,7 @@ impl Vm {
             tail: String::new(),
             sources: HashMap::new(),
             origin: "<input>".into(),
+            including: Vec::new(),
         }
     }
 
@@ -234,9 +239,11 @@ impl Vm {
     fn eval_named(&mut self, path: &Path, t: &mut dyn Target) -> Result<()> {
         let src = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         let outer = std::mem::replace(&mut self.origin, path.display().to_string());
+        self.including.push(path.to_path_buf());
         let r = self
             .eval(&src, t)
             .with_context(|| path.display().to_string());
+        self.including.pop();
         self.origin = outer;
         r
     }
@@ -364,6 +371,12 @@ impl Vm {
 
     /// Resolves a relative path against the working directory, then the config directory.
     pub fn resolve(&self, p: &Path) -> PathBuf {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let expanded = match (p.strip_prefix("~"), home) {
+            (Ok(rest), Some(h)) => h.join(rest),
+            _ => p.to_path_buf(),
+        };
+        let p = expanded.as_path();
         if p.is_absolute() || p.exists() {
             return p.to_path_buf();
         }
@@ -445,6 +458,17 @@ impl Vm {
             "char" | "[char]" => {
                 let c = inp.word().context("missing char")?;
                 self.push(c.chars().next().unwrap_or(' ') as i64);
+            }
+            "include" => {
+                let name = inp.word().context("missing file name")?;
+                let p = self.resolve(Path::new(&name));
+                self.eval_named(&p, t)?;
+            }
+            "include-global" => {
+                let g = self.settings.global.clone();
+                if let Some(g) = g.filter(|g| !self.including.contains(g)) {
+                    self.eval_named(&g, t)?;
+                }
             }
             "see" | "list" => {
                 let xt = self.tick(inp)?;
@@ -1033,6 +1057,22 @@ mod tests {
         .unwrap();
         assert_eq!(t.sent, ["1"]);
         assert!(vm.stack().is_empty());
+    }
+
+    #[test]
+    fn include_word() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("more.fs"), ": two 2 ;").unwrap();
+        let mut vm = Vm::new();
+        vm.settings.base = d.path().to_path_buf();
+        let mut t = Mecrisp::default();
+        vm.eval("include more.fs two", &mut t).unwrap();
+        assert_eq!(vm.stack(), [2]);
+        assert!(vm
+            .list(vm.find("two").unwrap())
+            .unwrap()
+            .contains("more.fs:1"));
+        assert!(vm.eval("include nope.fs", &mut t).is_err());
     }
 
     #[test]

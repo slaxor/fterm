@@ -41,7 +41,7 @@ programs.fterm = {
 };
 ```
 
-`init` is written to `~/.config/fterm/init.fs`, which loads before the project's `.fterm.fs`. The package is built against your own `pkgs`, and `overlays.default` provides `pkgs.fterm`. For the serial port your user needs to be in the `dialout` group (`users.users.<you>.extraGroups` on NixOS).
+`init` is written to `~/.config/fterm/init.fs`. It is used when there's no project `.fterm.fs`, or when a project config says `include-global`. The package is built against your own `pkgs`, and `overlays.default` provides `pkgs.fterm`. For the serial port your user needs to be in the `dialout` group (`users.users.<you>.extraGroups` on NixOS).
 
 ## Input
 
@@ -94,7 +94,7 @@ The same `#include` / `#require` lines work inside uploaded files. They are reso
 
 ## Config: `.fterm.fs`
 
-fterm loads `~/.config/fterm/init.fs` (`$XDG_CONFIG_HOME`) if it exists, then the nearest `.fterm.fs` found upwards from the working directory, or the file given with `-c`. Relative paths in it resolve against its directory. See `example.fterm.fs`.
+fterm loads the file given with `-c`, or else the nearest `.fterm.fs` found upwards from the working directory. Only if there is none does it load `~/.config/fterm/init.fs` (`$XDG_CONFIG_HOME`). A project config pulls the global one in with `include-global`, usually as its first line. Relative paths in it resolve against its directory. See `example.fterm.fs`.
 
 Host words on top of a small core Forth (stack, arithmetic, `if else then`, `begin until/again/while repeat`, `do loop i j`, `variable constant create , @ !`, `s" ." ' execute recurse`, `words see list`):
 
@@ -117,7 +117,9 @@ Host words on top of a small core Forth (stack, arithmetic, `if else then`, `beg
 | `expect` | `( a u ms -- f )` | wait for text in the output (includes the reply to the last `send`) |
 | `delay` | `( ms -- )` | wait, showing output |
 | `bind` | `( xt "key" -- )` | `' w bind F5`, `' w bind p` (ctrl-t p) |
-| `included` | `( a u -- )` | load more host Forth |
+| `include` | `( "file" -- )` | load more host Forth (`~/` expands) |
+| `included` | `( a u -- )` | same, taking a string |
+| `include-global` | `( -- )` | load `~/.config/fterm/init.fs`, if it exists |
 | `forget-required` | `( -- )` | clear the `#require` list |
 | `see` | `( "name" -- )` | decompile a host word |
 | `list` | `( "name" -- )` | show a colon definition's source with `file:line` |

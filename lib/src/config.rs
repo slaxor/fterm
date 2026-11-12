@@ -25,7 +25,8 @@ pub fn global_config() -> Option<PathBuf> {
     Some(dir.join("fterm/init.fs")).filter(|p| p.is_file())
 }
 
-/// Creates a machine, runs the global config, then `explicit` or the nearest `.fterm.fs`.
+/// Creates a machine and runs `explicit` or the nearest `.fterm.fs`; only without one the
+/// global config. A project config pulls the global one in with `include-global`.
 pub fn load(explicit: Option<&Path>) -> Result<Vm> {
     load_from(
         global_config().as_deref(),
@@ -36,13 +37,16 @@ pub fn load(explicit: Option<&Path>) -> Result<Vm> {
 
 fn load_from(global: Option<&Path>, explicit: Option<&Path>, cwd: &Path) -> Result<Vm> {
     let mut vm = Vm::new();
-    if let Some(g) = global {
-        vm.eval_file(g, &mut Offline)?;
-    }
     vm.settings.base = cwd.to_path_buf();
+    vm.settings.global = global.map(Path::to_path_buf);
     let project = explicit.map(Path::to_path_buf).or_else(|| find_config(cwd));
-    if let Some(p) = project {
-        vm.eval_file(&p, &mut Offline)?;
+    match (project, global) {
+        (Some(p), _) => vm.eval_file(&p, &mut Offline)?,
+        (None, Some(g)) => {
+            vm.eval_file(g, &mut Offline)?;
+            vm.settings.base = cwd.to_path_buf();
+        }
+        (None, None) => {}
     }
     Ok(vm)
 }
@@ -83,17 +87,16 @@ mod tests {
     }
 
     #[test]
-    fn global_then_project() {
+    fn project_replaces_global() {
         let d = tempfile::tempdir().unwrap();
         let g = d.path().join("init.fs");
         std::fs::write(&g, "9600 baud : hi ; s\" /dev/a\" port").unwrap();
         let proj = d.path().join("proj");
         std::fs::create_dir(&proj).unwrap();
+        let port_baud = |vm: &Vm| (vm.settings.port.clone(), vm.settings.baud);
+
         let vm = load_from(Some(&g), None, &proj).unwrap();
-        assert_eq!(
-            (vm.settings.port.as_str(), vm.settings.baud),
-            ("/dev/a", 9600)
-        );
+        assert_eq!(port_baud(&vm), ("/dev/a".into(), 9600));
         assert!(vm.find("hi").is_some());
         assert_eq!(
             vm.settings.base, proj,
@@ -102,9 +105,29 @@ mod tests {
 
         std::fs::write(proj.join(CONFIG), "s\" /dev/b\" port").unwrap();
         let vm = load_from(Some(&g), None, &proj).unwrap();
+        assert_eq!(port_baud(&vm), ("/dev/b".into(), 115200));
+        assert!(
+            vm.find("hi").is_none(),
+            "global must not load next to a project config"
+        );
+
+        std::fs::write(proj.join(CONFIG), "include-global s\" /dev/b\" port").unwrap();
+        let vm = load_from(Some(&g), None, &proj).unwrap();
+        assert_eq!(port_baud(&vm), ("/dev/b".into(), 9600));
+        assert!(vm.find("hi").is_some());
+
+        let vm = load_from(None, None, &proj).unwrap();
         assert_eq!(
-            (vm.settings.port.as_str(), vm.settings.baud),
-            ("/dev/b", 9600)
+            vm.settings.port, "/dev/b",
+            "include-global without init.fs is a no-op"
+        );
+
+        std::fs::write(&g, "include-global 1").unwrap();
+        let vm = load_from(Some(&g), None, d.path()).unwrap();
+        assert_eq!(
+            vm.stack(),
+            [1],
+            "include-global inside init.fs must not recurse"
         );
     }
 
