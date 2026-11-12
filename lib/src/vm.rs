@@ -42,7 +42,7 @@ enum Prim {
     Fetch, Store, CFetch, CStore, PlusStore, Here, Allot, Comma, Cells,
     ToR, RFrom, RFetch, I, J, Execute,
     Dot, Emit, Cr, Space, Type, Words,
-    Send, Run, Raw, Upload, Expect, Delay, Included,
+    Send, Run, Raw, Upload, UploadIf, Exists, Expect, Delay, Included,
     Port, Baud, Eol, Prompt, Error, NoErrors, Timeout, AddPath, HistFile, Forget, Bye,
 }
 
@@ -61,7 +61,7 @@ const PRIMS: &[(&str, Prim)] = {
         ("here", Here), ("allot", Allot), (",", Comma), ("cells", Cells),
         (">r", ToR), ("r>", RFrom), ("r@", RFetch), ("i", I), ("j", J), ("execute", Execute),
         (".", Dot), ("emit", Emit), ("cr", Cr), ("space", Space), ("type", Type), ("words", Words),
-        ("send", Send), ("run", Run), ("raw", Raw), ("upload", Upload), ("expect", Expect), ("delay", Delay),
+        ("send", Send), ("run", Run), ("raw", Raw), ("upload", Upload), ("upload?", UploadIf), ("exists", Exists), ("expect", Expect), ("delay", Delay),
         ("included", Included),
         ("port", Port), ("baud", Baud), ("eol", Eol), ("prompt", Prompt), ("error", Error),
         ("no-errors", NoErrors), ("timeout", Timeout), ("path", AddPath), ("history", HistFile),
@@ -754,6 +754,8 @@ impl Vm {
             Run => { let mut b = self.pop_str()?.into_bytes(); b.extend_from_slice(&self.settings.proto.eol); self.tail.clear(); t.write(&b)? }
             Raw => { let s = self.pop_str()?; self.tail.clear(); t.write(s.as_bytes())? }
             Upload => { let s = self.pop_str()?; self.upload_file(Path::new(&s), t)?; }
+            UploadIf => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); if p.is_file() { self.upload_file(&p, t)?; } }
+            Exists => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); self.push(flag(p.is_file())) }
             Expect => { let ms = self.pop()?; let s = self.pop_str()?; let tail = std::mem::take(&mut self.tail); let ok = tail.contains(&s) || link::expect(t, &s, millis(ms)?)?; self.push(flag(ok)) }
             Delay => { let ms = self.pop()?; link::delay(t, millis(ms)?)? }
             Included => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); self.eval_named(&p, t)? }
@@ -1012,6 +1014,25 @@ mod tests {
         let mut vm = vm;
         assert!(vm.eval("list five", &mut Mecrisp::default()).is_err());
         assert!(vm.eval("see nope", &mut Mecrisp::default()).is_err());
+    }
+
+    #[test]
+    fn optional_upload() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("autoexec.fs"), "1\n").unwrap();
+        let mut vm = Vm::new();
+        vm.settings.base = d.path().to_path_buf();
+        let mut t = Mecrisp::default();
+        vm.eval("s\" autoexec.fs\" exists s\" missing.fs\" exists", &mut t)
+            .unwrap();
+        assert_eq!(vm.stack(), [-1, 0]);
+        vm.eval(
+            "2drop s\" missing.fs\" upload? s\" autoexec.fs\" upload?",
+            &mut t,
+        )
+        .unwrap();
+        assert_eq!(t.sent, ["1"]);
+        assert!(vm.stack().is_empty());
     }
 
     #[test]

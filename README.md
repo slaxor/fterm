@@ -112,6 +112,8 @@ Host words on top of a small core Forth (stack, arithmetic, `if else then`, `beg
 | `run` | `( a u -- )` | send a line, don't wait (for words that loop) |
 | `raw` | `( a u -- )` | send bytes as they are |
 | `upload` | `( a u -- )` | upload a file |
+| `upload?` | `( a u -- )` | upload a file if it exists, otherwise do nothing |
+| `exists` | `( a u -- f )` | true if the file exists (working dir, then config dir) |
 | `expect` | `( a u ms -- f )` | wait for text in the output (includes the reply to the last `send`) |
 | `delay` | `( ms -- )` | wait, showing output |
 | `bind` | `( xt "key" -- )` | `' w bind F5`, `' w bind p` (ctrl-t p) |
@@ -121,7 +123,7 @@ Host words on top of a small core Forth (stack, arithmetic, `if else then`, `beg
 | `list` | `( "name" -- )` | show a colon definition's source with `file:line` |
 | `bye` | `( -- )` | quit |
 
-If you define `on-connect`, it runs after every (re)connect.
+If you define `on-connect`, it runs after every (re)connect, e.g. `: on-connect s" autoexec.fs" upload? ;`.
 
 Default error patterns (Mecrisp-Stellaris): `not found.`, `Stack underflow`, `Stack not balanced`, `Structures don't match`, `Jump too far`.
 

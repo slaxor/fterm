@@ -17,4 +17,4 @@ s" lib" path                    \ extra #include/#require search dir
 ' probe  bind p                 \ ctrl-t p
 
 \ runs after every (re)connect
-\ : on-connect  s" pins.fs" upload ;
+\ : on-connect  s" autoexec.fs" upload? ;   \ upload? skips missing files
