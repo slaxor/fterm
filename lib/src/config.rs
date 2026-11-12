@@ -17,15 +17,31 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Creates a machine and runs `explicit`, or the nearest `.fterm.fs`, in it.
+/// User-wide config: `$XDG_CONFIG_HOME/fterm/init.fs` or `~/.config/fterm/init.fs`.
+pub fn global_config() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(dir.join("fterm/init.fs")).filter(|p| p.is_file())
+}
+
+/// Creates a machine, runs the global config, then `explicit` or the nearest `.fterm.fs`.
 pub fn load(explicit: Option<&Path>) -> Result<Vm> {
+    load_from(
+        global_config().as_deref(),
+        explicit,
+        &std::env::current_dir()?,
+    )
+}
+
+fn load_from(global: Option<&Path>, explicit: Option<&Path>, cwd: &Path) -> Result<Vm> {
     let mut vm = Vm::new();
-    let cwd = std::env::current_dir()?;
-    vm.settings.base = cwd.clone();
-    let path = explicit
-        .map(Path::to_path_buf)
-        .or_else(|| find_config(&cwd));
-    if let Some(p) = path {
+    if let Some(g) = global {
+        vm.eval_file(g, &mut Offline)?;
+    }
+    vm.settings.base = cwd.to_path_buf();
+    let project = explicit.map(Path::to_path_buf).or_else(|| find_config(cwd));
+    if let Some(p) = project {
         vm.eval_file(&p, &mut Offline)?;
     }
     Ok(vm)
@@ -64,6 +80,32 @@ mod tests {
         let vm = load(Some(&cfg)).unwrap();
         assert_eq!(vm.settings.port, "/dev/null");
         assert_eq!(vm.settings.base, d.path());
+    }
+
+    #[test]
+    fn global_then_project() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("init.fs");
+        std::fs::write(&g, "9600 baud : hi ; s\" /dev/a\" port").unwrap();
+        let proj = d.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let vm = load_from(Some(&g), None, &proj).unwrap();
+        assert_eq!(
+            (vm.settings.port.as_str(), vm.settings.baud),
+            ("/dev/a", 9600)
+        );
+        assert!(vm.find("hi").is_some());
+        assert_eq!(
+            vm.settings.base, proj,
+            "base must not stay in the global config dir"
+        );
+
+        std::fs::write(proj.join(CONFIG), "s\" /dev/b\" port").unwrap();
+        let vm = load_from(Some(&g), None, &proj).unwrap();
+        assert_eq!(
+            (vm.settings.port.as_str(), vm.settings.baud),
+            ("/dev/b", 9600)
+        );
     }
 
     #[test]

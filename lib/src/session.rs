@@ -1,13 +1,12 @@
 //! Interactive session: terminal passthrough, escape commands, `#` directives, reconnect.
 
 use crate::ctl::{self, Cmd, Req};
+use crate::edit::{Action, Editor, History};
 use crate::keys::{self, Keys};
 use crate::link::Target;
 use crate::vm::Vm;
 use anyhow::{bail, Context, Result};
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent};
 use crossterm::{execute, terminal};
 use serialport::SerialPort;
 use std::collections::VecDeque;
@@ -33,10 +32,13 @@ const HELP: &str = "\
 ctrl-t q  quit              ctrl-t :  host Forth prompt
 ctrl-t u  upload file       ctrl-t r  repeat last upload
 ctrl-t e  edit last error   ctrl-t c  forget #require'd files
-ctrl-t h  this help         ctrl-t ctrl-t  send ctrl-t
+ctrl-t l  raw passthrough   ctrl-t ctrl-t  send ctrl-t
+ctrl-t h  this help
 ctrl-t <c> / F1..F12  bound macros (bind in .fterm.fs)
+line editing: up/down ctrl-r ctrl-a/e/k/u/w/y alt-b/f
+after Enter keys go raw to the target until it prompts
 ctrl-c during an upload aborts it
-at line start: #i file  #r file  #e [file]  #f forth";
+#i file  #r file  #e [file]  #f forth";
 
 /// A `#` line typed at the start of a line.
 #[derive(Debug, PartialEq)]
@@ -64,15 +66,19 @@ pub fn parse_hash(line: &str) -> Hash {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LineKind {
-    Hash,
+    Target,
     Forth,
     Upload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
-    Normal,
-    Escape,
-    Line(LineKind, String),
+    /// Local line editing.
+    Edit,
+    /// Line sent; keys go raw to the target until it prompts.
+    Busy,
+    /// Raw passthrough until toggled off.
+    Raw,
 }
 
 struct RawMode;
@@ -161,8 +167,12 @@ pub struct Session {
     out: Stdout,
     keys: Keys,
     mode: Mode,
+    esc: bool,
+    kind: LineKind,
+    ed: Editor,
+    hist: History,
+    watch: Vec<u8>,
     later: VecDeque<Ev>,
-    bol: bool,
     next_try: Instant,
     last_open_err: Option<String>,
 }
@@ -172,6 +182,10 @@ pub fn run(vm: Vm, sock: &Path) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let _srv = ctl::serve(sock, tx.clone())?;
     let keys = Keys::spawn(tx.clone());
+    let (hist, hist_err) = match History::load(vm.settings.history.as_deref()) {
+        Ok(h) => (h, None),
+        Err(e) => (History::default(), Some(format!("history: {e}"))),
+    };
     let raw = RawMode::on()?;
     let mut s = Session {
         vm,
@@ -180,9 +194,13 @@ pub fn run(vm: Vm, sock: &Path) -> Result<()> {
         rx,
         out: stdout(),
         keys,
-        mode: Mode::Normal,
+        mode: Mode::Edit,
+        esc: false,
+        kind: LineKind::Target,
+        ed: Editor::default(),
+        hist,
+        watch: Vec::new(),
         later: VecDeque::new(),
-        bol: true,
         next_try: Instant::now(),
         last_open_err: None,
     };
@@ -191,6 +209,9 @@ pub fn run(vm: Vm, sock: &Path) -> Result<()> {
         "{} @ {} baud, ctrl-t h for help",
         st.port, st.baud
     ));
+    if let Some(e) = hist_err {
+        s.note(&e);
+    }
     let r = s.main_loop();
     drop(raw);
     r
@@ -216,9 +237,12 @@ impl Session {
 
     fn handle(&mut self, ev: Ev) {
         match ev {
-            Ev::Serial(b) => show(&mut self.out, &b),
+            Ev::Serial(b) => self.serial(&b),
             Ev::Lost(e) => {
                 self.port = None;
+                if self.mode == Mode::Busy {
+                    self.mode = Mode::Edit;
+                }
                 self.note(&format!("disconnected: {e}"));
             }
             Ev::Key(k) => self.key(k),
@@ -229,11 +253,72 @@ impl Session {
         }
     }
 
+    fn line_visible(&self) -> bool {
+        self.mode == Mode::Edit && (self.kind != LineKind::Target || !self.ed.is_empty())
+    }
+
+    fn hide_line(&mut self) {
+        if self.line_visible() {
+            self.echo("\r\x1b[K");
+        }
+    }
+
+    fn show_line(&mut self) {
+        if self.line_visible() {
+            self.draw_line();
+        }
+    }
+
+    fn draw_line(&mut self) {
+        let label = match self.kind {
+            LineKind::Target => "",
+            LineKind::Forth => "forth> ",
+            LineKind::Upload => "upload> ",
+        };
+        let s = self.ed.render(label);
+        self.echo(&s);
+    }
+
+    fn serial(&mut self, b: &[u8]) {
+        let visible = self.line_visible();
+        self.hide_line();
+        show(&mut self.out, b);
+        if self.mode == Mode::Busy {
+            self.watch_prompt(b);
+        }
+        if visible && !b.ends_with(b"\n") {
+            self.echo("\n");
+        }
+        self.show_line();
+    }
+
+    fn watch_prompt(&mut self, b: &[u8]) {
+        self.watch.extend_from_slice(b);
+        while let Some(pos) = self.watch.iter().position(|&c| c == b'\n') {
+            let line: Vec<u8> = self.watch.drain(..=pos).collect();
+            if self
+                .vm
+                .settings
+                .proto
+                .classify(&String::from_utf8_lossy(&line))
+                .is_some()
+            {
+                self.mode = Mode::Edit;
+                self.watch.clear();
+                return;
+            }
+        }
+        let excess = self.watch.len().saturating_sub(4096);
+        self.watch.drain(..excess);
+    }
+
     fn note(&mut self, msg: &str) {
+        self.hide_line();
         show(
             &mut self.out,
             format!("\n\x1b[33m[fterm] {msg}\x1b[0m\n").as_bytes(),
         );
+        self.show_line();
     }
 
     fn reconnect(&mut self) {
@@ -270,14 +355,19 @@ impl Session {
         Ok(())
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, bytes: &[u8]) -> bool {
         let r = match self.port.as_mut() {
             Some(p) => p.write_all(bytes).and_then(|_| p.flush()),
-            None => return self.note("not connected"),
+            None => {
+                self.note("not connected");
+                return false;
+            }
         };
         if let Err(e) = r {
             self.note(&format!("write: {e}"));
+            return false;
         }
+        true
     }
 
     fn echo(&mut self, s: &str) {
@@ -288,6 +378,7 @@ impl Session {
         &mut self,
         f: impl FnOnce(&mut Vm, &mut dyn Target) -> Result<String>,
     ) -> Result<String, String> {
+        self.hide_line();
         let mut t = Live {
             port: &mut self.port,
             rx: &self.rx,
@@ -295,54 +386,68 @@ impl Session {
             later: &mut self.later,
         };
         let r = f(&mut self.vm, &mut t).map_err(|e| format!("{e:#}"));
-        self.bol = true;
         match &r {
             Ok(m) if !m.is_empty() => self.note(m),
-            Ok(_) => {}
+            Ok(_) => self.show_line(),
             Err(e) => self.note(e),
         }
         r
     }
 
     fn key(&mut self, k: KeyEvent) {
-        match std::mem::replace(&mut self.mode, Mode::Normal) {
-            Mode::Normal => self.normal_key(k),
-            Mode::Escape => self.escape_key(k),
-            Mode::Line(kind, buf) => self.line_key(kind, buf, k),
+        if std::mem::take(&mut self.esc) {
+            return self.escape_key(k);
         }
-    }
-
-    fn normal_key(&mut self, k: KeyEvent) {
         if keys::is_ctrl(&k, 't') {
-            self.mode = Mode::Escape;
+            self.esc = true;
             return;
         }
         if let Some(xt) = keys::fkey_name(&k).and_then(|n| self.vm.binds.get(&n).copied()) {
-            self.run_xt(xt);
-            return;
+            return self.run_xt(xt);
         }
-        if self.bol && k.code == KeyCode::Char('#') && !k.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            self.echo("#");
-            self.mode = Mode::Line(LineKind::Hash, "#".into());
-            return;
+        match self.mode {
+            Mode::Edit => self.edit_key(k),
+            Mode::Busy | Mode::Raw => {
+                if let Some(b) = keys::key_bytes(&k) {
+                    self.write(&b);
+                }
+            }
         }
-        if let Some(b) = keys::key_bytes(&k) {
-            self.bol = k.code == KeyCode::Enter;
-            self.write(&b);
+    }
+
+    fn edit_key(&mut self, k: KeyEvent) {
+        match self.ed.key(&k, &self.hist) {
+            Action::Redraw => self.draw_line(),
+            Action::Submit(line) => self.submit(line),
+            Action::Cancel => {
+                self.echo("\r\x1b[K");
+                self.kind = LineKind::Target;
+            }
+            Action::Ignored => {}
         }
     }
 
     fn escape_key(&mut self, k: KeyEvent) {
         if keys::is_ctrl(&k, 't') {
-            return self.write(&[0x14]);
+            self.write(&[0x14]);
+            return;
         }
         let KeyCode::Char(c) = k.code else { return };
         match c {
             'q' => self.vm.quit = true,
             'h' => self.note(HELP),
-            ':' => self.prompt(LineKind::Forth, "forth> "),
-            'u' => self.prompt(LineKind::Upload, "upload> "),
+            ':' => self.prompt(LineKind::Forth),
+            'u' => self.prompt(LineKind::Upload),
+            'l' => {
+                self.hide_line();
+                self.mode = if self.mode == Mode::Raw {
+                    Mode::Edit
+                } else {
+                    Mode::Raw
+                };
+                let on = if self.mode == Mode::Raw { "on" } else { "off" };
+                self.note(&format!("raw passthrough {on}"));
+            }
             'r' => match self.vm.last_upload.clone() {
                 Some(p) => self.upload(&p),
                 None => self.note("nothing uploaded yet"),
@@ -359,53 +464,46 @@ impl Session {
         }
     }
 
-    fn prompt(&mut self, kind: LineKind, label: &str) {
-        self.echo(&format!("\n{label}"));
-        self.mode = Mode::Line(kind, String::new());
+    fn prompt(&mut self, kind: LineKind) {
+        self.hide_line();
+        self.mode = Mode::Edit;
+        self.kind = kind;
+        self.ed.clear();
+        self.draw_line();
     }
 
-    fn line_key(&mut self, kind: LineKind, mut buf: String, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
-                self.echo("\n");
-                self.bol = true;
-                return self.run_line(kind, &buf);
-            }
-            KeyCode::Esc => return self.echo("\n"),
-            _ if keys::is_ctrl(&k, 'c') => return self.echo("\n"),
-            KeyCode::Backspace => {
-                if buf.pop().is_some() {
-                    self.echo("\x08 \x08");
-                }
-                if kind == LineKind::Hash && buf.is_empty() {
-                    return;
-                }
-            }
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                buf.push(c);
-                self.echo(&c.to_string());
-            }
-            _ => {}
+    fn submit(&mut self, line: String) {
+        let kind = std::mem::replace(&mut self.kind, LineKind::Target);
+        if let Err(e) = self.hist.push(&line) {
+            self.note(&format!("history: {e}"));
         }
-        self.mode = Mode::Line(kind, buf);
+        let hash = match kind {
+            LineKind::Target if line.starts_with('#') => parse_hash(&line),
+            _ => Hash::Pass,
+        };
+        if kind == LineKind::Target && hash == Hash::Pass {
+            self.echo("\r\x1b[K");
+            return self.send_line(&line);
+        }
+        self.echo("\n");
+        match (kind, hash) {
+            (LineKind::Forth, _) => self.eval(&line),
+            (LineKind::Upload, _) if line.trim().is_empty() => {}
+            (LineKind::Upload, _) => self.upload(Path::new(line.trim())),
+            (_, Hash::Include(p)) => self.upload(Path::new(&p)),
+            (_, Hash::Require(p)) => self.require(Path::new(&p)),
+            (_, Hash::Edit(p)) => self.edit(p.as_deref().map(Path::new)),
+            (_, Hash::Forth(s)) => self.eval(&s),
+            (_, Hash::Pass) => unreachable!("handled above"),
+        }
     }
 
-    fn run_line(&mut self, kind: LineKind, line: &str) {
-        match kind {
-            LineKind::Forth => self.eval(line),
-            LineKind::Upload if line.trim().is_empty() => {}
-            LineKind::Upload => self.upload(Path::new(line.trim())),
-            LineKind::Hash => match parse_hash(line) {
-                Hash::Include(p) => self.upload(Path::new(&p)),
-                Hash::Require(p) => self.require(Path::new(&p)),
-                Hash::Edit(p) => self.edit(p.as_deref().map(Path::new)),
-                Hash::Forth(s) => self.eval(&s),
-                Hash::Pass => {
-                    let mut b = line.as_bytes().to_vec();
-                    b.extend_from_slice(&self.vm.settings.proto.eol.clone());
-                    self.write(&b);
-                }
-            },
+    fn send_line(&mut self, line: &str) {
+        let mut b = line.as_bytes().to_vec();
+        b.extend_from_slice(&self.vm.settings.proto.eol.clone());
+        if self.write(&b) {
+            self.mode = Mode::Busy;
+            self.watch.clear();
         }
     }
 
@@ -437,16 +535,22 @@ impl Session {
     }
 
     fn paste(&mut self, text: &str) {
-        if let Mode::Line(_, buf) = &mut self.mode {
-            let first = text.lines().next().unwrap_or("");
-            buf.push_str(first);
-            let first = first.to_string();
-            return self.echo(&first);
+        let one_line = text.trim_end_matches(['\r', '\n']);
+        match self.mode {
+            Mode::Edit if !one_line.contains(['\r', '\n']) => {
+                self.ed.insert(one_line);
+                self.draw_line();
+            }
+            Mode::Edit => {
+                let _ = self.script(|vm, t| {
+                    vm.upload_text("<paste>", text, t)
+                        .map(|n| format!("paste: {n} lines ok"))
+                });
+            }
+            Mode::Busy | Mode::Raw => {
+                self.write(text.as_bytes());
+            }
         }
-        let _ = self.script(|vm, t| {
-            vm.upload_text("<paste>", text, t)
-                .map(|n| format!("paste: {n} lines ok"))
-        });
     }
 
     fn ctl(&mut self, r: Req) {
@@ -472,7 +576,7 @@ impl Session {
         if let Err(e) = self.spawn_editor(&file, line) {
             self.note(&format!("editor: {e:#}"));
         }
-        self.bol = true;
+        self.show_line();
     }
 
     fn spawn_editor(&mut self, file: &PathBuf, line: usize) -> Result<()> {

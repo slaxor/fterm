@@ -3,7 +3,7 @@
 use crate::link::{self, Protocol, Target, UploadError};
 use crate::source::{Line, Loader};
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -15,6 +15,7 @@ pub struct Settings {
     pub baud: u32,
     pub proto: Protocol,
     pub path: Vec<PathBuf>,
+    pub history: Option<PathBuf>,
     pub base: PathBuf,
 }
 
@@ -25,6 +26,7 @@ impl Default for Settings {
             baud: 115200,
             proto: Protocol::default(),
             path: Vec::new(),
+            history: crate::edit::default_history_path(),
             base: PathBuf::from("."),
         }
     }
@@ -41,7 +43,7 @@ enum Prim {
     ToR, RFrom, RFetch, I, J, Execute,
     Dot, Emit, Cr, Space, Type, Words,
     Send, Run, Raw, Upload, Expect, Delay, Included,
-    Port, Baud, Eol, Prompt, Error, NoErrors, Timeout, AddPath, Forget, Bye,
+    Port, Baud, Eol, Prompt, Error, NoErrors, Timeout, AddPath, HistFile, Forget, Bye,
 }
 
 #[rustfmt::skip]
@@ -62,7 +64,7 @@ const PRIMS: &[(&str, Prim)] = {
         ("send", Send), ("run", Run), ("raw", Raw), ("upload", Upload), ("expect", Expect), ("delay", Delay),
         ("included", Included),
         ("port", Port), ("baud", Baud), ("eol", Eol), ("prompt", Prompt), ("error", Error),
-        ("no-errors", NoErrors), ("timeout", Timeout), ("path", AddPath),
+        ("no-errors", NoErrors), ("timeout", Timeout), ("path", AddPath), ("history", HistFile),
         ("forget-required", Forget), ("bye", Bye),
     ]
 };
@@ -103,10 +105,18 @@ enum Mark {
     Do(usize),
 }
 
+#[derive(Clone, Debug)]
+struct Source {
+    origin: String,
+    line: usize,
+    text: String,
+}
+
 struct Compiling {
     name: String,
     ops: Vec<Op>,
     marks: Vec<Mark>,
+    start: usize,
 }
 
 struct Input {
@@ -158,6 +168,8 @@ pub struct Vm {
     pub last_error: Option<UploadError>,
     pub quit: bool,
     tail: String,
+    sources: HashMap<usize, Source>,
+    origin: String,
 }
 
 impl Default for Vm {
@@ -190,6 +202,8 @@ impl Vm {
             last_error: None,
             quit: false,
             tail: String::new(),
+            sources: HashMap::new(),
+            origin: "<input>".into(),
         }
     }
 
@@ -211,12 +225,69 @@ impl Vm {
 
     /// Runs the host Forth file at `path`; it becomes the base for relative paths.
     pub fn eval_file(&mut self, path: &Path, t: &mut dyn Target) -> Result<()> {
-        let src = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         if let Some(dir) = path.parent() {
             self.settings.base = dir.to_path_buf();
         }
-        self.eval(&src, t)
-            .with_context(|| path.display().to_string())
+        self.eval_named(path, t)
+    }
+
+    fn eval_named(&mut self, path: &Path, t: &mut dyn Target) -> Result<()> {
+        let src = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
+        let outer = std::mem::replace(&mut self.origin, path.display().to_string());
+        let r = self
+            .eval(&src, t)
+            .with_context(|| path.display().to_string());
+        self.origin = outer;
+        r
+    }
+
+    /// Decompiled form of a word, as printed by `see`.
+    pub fn see(&self, xt: usize) -> Result<String> {
+        let w = self.word(xt)?;
+        Ok(match &w.kind {
+            Kind::Prim(_) => format!("{} is a primitive\n", w.name),
+            Kind::Const(v) => format!("{v} constant {}\n", w.name),
+            Kind::Var(a) => format!("variable {} \\ at {a}\n", w.name),
+            Kind::Colon(ops) => {
+                let mut out = format!(": {}\n", w.name);
+                for (i, op) in ops.iter().enumerate() {
+                    out.push_str(&format!("  {i:3}  {}\n", self.op_text(op)));
+                }
+                out.push_str(";\n");
+                out
+            }
+        })
+    }
+
+    /// Source text of a colon definition with its origin, as printed by `list`.
+    pub fn list(&self, xt: usize) -> Result<String> {
+        let w = self.word(xt)?;
+        let s = self
+            .sources
+            .get(&xt)
+            .ok_or_else(|| anyhow!("{}: no source (not a colon definition)", w.name))?;
+        Ok(format!("\\ {}:{}\n{}\n", s.origin, s.line, s.text))
+    }
+
+    fn op_text(&self, op: &Op) -> String {
+        let name = |xt: &usize| {
+            self.words
+                .get(*xt)
+                .map_or("<recurse>", |w| w.name.as_str())
+                .to_string()
+        };
+        let text = |a: &usize, u: &usize| self.string(*a as i64, *u as i64).unwrap_or_default();
+        match op {
+            Op::Call(xt) => name(xt),
+            Op::Lit(n) => n.to_string(),
+            Op::Str(a, u) => format!("s\" {}\"", text(a, u)),
+            Op::Print(a, u) => format!(".\" {}\"", text(a, u)),
+            Op::Branch(to) => format!("branch -> {to}"),
+            Op::BranchZ(to) => format!("0branch -> {to}"),
+            Op::Do => "do".into(),
+            Op::Loop(to) => format!("loop -> {to}"),
+            Op::Exit => "exit".into(),
+        }
     }
 
     /// Executes the word with execution token `xt`.
@@ -327,11 +398,13 @@ impl Vm {
         }
         match lower.as_str() {
             ":" => {
+                let start = inp.pos - 1;
                 let name = inp.word().context("missing name")?;
                 self.comp = Some(Compiling {
                     name,
                     ops: Vec::new(),
                     marks: Vec::new(),
+                    start,
                 });
             }
             "variable" => {
@@ -373,6 +446,15 @@ impl Vm {
                 let c = inp.word().context("missing char")?;
                 self.push(c.chars().next().unwrap_or(' ') as i64);
             }
+            "see" | "list" => {
+                let xt = self.tick(inp)?;
+                let text = if lower == "see" {
+                    self.see(xt)?
+                } else {
+                    self.list(xt)?
+                };
+                t.emit(&text);
+            }
             "bind" => {
                 let key = normalize_key(&inp.word().context("missing key name")?);
                 let xt = self.pop()? as usize;
@@ -393,7 +475,7 @@ impl Vm {
 
     fn compile_token(&mut self, tok: &str, lower: &str, inp: &mut Input) -> Result<()> {
         let op = match lower {
-            ";" => return self.finish(),
+            ";" => return self.finish(inp),
             "if" => return self.mark(Mark::If, Op::BranchZ(0)),
             "else" => {
                 let n = self.here_op();
@@ -486,11 +568,21 @@ impl Vm {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn finish(&mut self, inp: &Input) -> Result<()> {
         let c = self.comp.take().context("not compiling")?;
         if !c.marks.is_empty() {
             bail!("unbalanced control structure in {}", c.name);
         }
+        let text: String = inp.src[c.start..inp.pos.min(inp.src.len())]
+            .iter()
+            .collect();
+        let line = inp.src[..c.start].iter().filter(|&&ch| ch == '\n').count() + 1;
+        let src = Source {
+            origin: self.origin.clone(),
+            line,
+            text,
+        };
+        self.sources.insert(self.words.len(), src);
         self.words.push(Word {
             name: c.name,
             kind: Kind::Colon(Rc::new(c.ops)),
@@ -664,7 +756,7 @@ impl Vm {
             Upload => { let s = self.pop_str()?; self.upload_file(Path::new(&s), t)?; }
             Expect => { let ms = self.pop()?; let s = self.pop_str()?; let tail = std::mem::take(&mut self.tail); let ok = tail.contains(&s) || link::expect(t, &s, millis(ms)?)?; self.push(flag(ok)) }
             Delay => { let ms = self.pop()?; link::delay(t, millis(ms)?)? }
-            Included => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); let src = std::fs::read_to_string(&p).with_context(|| p.display().to_string())?; self.eval(&src, t)? }
+            Included => { let s = self.pop_str()?; let p = self.resolve(Path::new(&s)); self.eval_named(&p, t)? }
             Port => self.settings.port = self.pop_str()?,
             Baud => self.settings.baud = u32::try_from(self.pop()?).context("bad baud rate")?,
             Eol => { let c = self.pop()?; self.settings.proto.eol = if c == 0 { b"\r\n".to_vec() } else { vec![c as u8] } }
@@ -673,6 +765,7 @@ impl Vm {
             NoErrors => self.settings.proto.errors.clear(),
             Timeout => self.settings.proto.timeout = millis(self.pop()?)?,
             AddPath => { let s = self.pop_str()?; let p = self.settings.base.join(s); self.settings.path.push(p) }
+            HistFile => { let s = self.pop_str()?; self.settings.history = (!s.is_empty()).then(|| self.settings.base.join(s)) }
             Forget => self.required.clear(),
             Bye => self.quit = true,
         }
@@ -895,6 +988,30 @@ mod tests {
         vm.eval("forget-required", &mut t).unwrap();
         assert_eq!(vm.require_file(&g, &mut t).unwrap(), 1);
         assert_eq!(t.sent, ["1", "2", "bad", "3", "3"]);
+    }
+
+    #[test]
+    fn see_and_list() {
+        let src = "\\ header\n: sq ( n -- n*n ) dup * ;\n: t if .\" yes\" else 0 then ;\n5 constant five variable v";
+        let (vm, t) = run(&format!("{src}\nsee sq list sq see t see five see dup"));
+        assert!(
+            t.notes.contains(": sq\n    0  dup\n    1  *\n;"),
+            "{}",
+            t.notes
+        );
+        assert!(
+            t.notes
+                .contains("\\ <input>:2\n: sq ( n -- n*n ) dup * ;\n"),
+            "{}",
+            t.notes
+        );
+        assert!(t.notes.contains("0branch -> 3"), "{}", t.notes);
+        assert!(t.notes.contains(".\" yes\""), "{}", t.notes);
+        assert!(t.notes.contains("5 constant five"), "{}", t.notes);
+        assert!(t.notes.contains("dup is a primitive"), "{}", t.notes);
+        let mut vm = vm;
+        assert!(vm.eval("list five", &mut Mecrisp::default()).is_err());
+        assert!(vm.eval("see nope", &mut Mecrisp::default()).is_err());
     }
 
     #[test]

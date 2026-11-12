@@ -3,6 +3,7 @@
 pub mod config;
 pub mod ctl;
 pub mod direct;
+pub mod edit;
 pub mod keys;
 pub mod link;
 pub mod session;

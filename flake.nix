@@ -14,13 +14,10 @@
         extensions = [ "rust-src" "rust-analyzer" ];
       };
     in {
-      packages.x86_64-linux.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "fterm";
-        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
-        meta.mainProgram = "fterm";
-      };
+      packages.x86_64-linux.default = pkgs.callPackage ./nix/package.nix { };
+      overlays.default = final: _: { fterm = final.callPackage ./nix/package.nix { }; };
+      homeManagerModules.default = ./nix/hm-module.nix;
+      homeModules.default = ./nix/hm-module.nix;
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = [ rust pkgs.just pkgs.cargo-nextest ];
       };

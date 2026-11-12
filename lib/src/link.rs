@@ -83,15 +83,22 @@ impl<'a> Matcher<'a> {
     }
 
     fn classify(&self, line: &str) -> Option<Reply> {
-        if is_ok(line, &self.proto.ok) {
+        self.proto
+            .classify(line.strip_prefix(self.echo).unwrap_or(line))
+    }
+}
+
+impl Protocol {
+    /// Decides whether one complete output line is a prompt, an error, or neither.
+    pub fn classify(&self, line: &str) -> Option<Reply> {
+        let line = line.trim_end();
+        if is_ok(line, &self.ok) {
             return Some(Reply::Ok);
         }
-        let rest = line.strip_prefix(self.echo).unwrap_or(line);
-        self.proto
-            .errors
+        self.errors
             .iter()
-            .any(|e| rest.contains(e.as_str()))
-            .then(|| Reply::Error(rest.trim().to_string()))
+            .any(|e| line.contains(e.as_str()))
+            .then(|| Reply::Error(line.trim().to_string()))
     }
 }
 
@@ -246,6 +253,17 @@ pub mod fake {
 mod tests {
     use super::fake::Mecrisp;
     use super::*;
+
+    #[test]
+    fn protocol_classify() {
+        let p = Protocol::default();
+        assert_eq!(p.classify("log  ok.\r"), Some(Reply::Ok));
+        assert_eq!(
+            p.classify("x not found."),
+            Some(Reply::Error("x not found.".into()))
+        );
+        assert_eq!(p.classify("gap 1000 pulse 100"), None);
+    }
 
     #[test]
     fn matcher_cases() {
