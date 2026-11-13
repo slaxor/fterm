@@ -65,7 +65,7 @@ After Enter, keys go raw to the target until it prompts with `ok.` (or reports a
 |-----|--------|
 | `ctrl-t q` | quit |
 | `ctrl-t :` | host Forth prompt |
-| `ctrl-t u` | upload a file (prompt) |
+| `ctrl-t u` | upload a file (prompt); `Tab` there opens the file picker |
 | `ctrl-t r` | repeat last upload |
 | `ctrl-t e` | edit the last error location (or last upload) |
 | `ctrl-t c` | forget the `#require` list (after a target reset) |
@@ -87,6 +87,12 @@ Lines starting with `#` are handled by fterm itself:
 | `#r file`, `#require file` | upload once per session |
 | `#e [file]` | `$VISUAL`/`$EDITOR` (fallback `nvim`) at `+LINE`; with no argument it opens the last error |
 | `#f forth` | run host Forth |
+
+`Tab` after `#i`, `#r` or `#e` opens the file picker and fills in the argument.
+
+### File picker
+
+A full-screen list of the Forth sources (`.fs .fth .4th .f .forth`) below the working directory and the `path` directories, skipping hidden dirs, `target/` and `result`. Typing filters fuzzily (word starts and consecutive letters rank first), `up`/`down`/`Tab`/`ctrl-n`/`ctrl-p` move, `PgUp`/`PgDn` page, `ctrl-u` clears, Enter chooses and Esc cancels. Terminals at least 100 columns wide get a preview of the selected file. From the upload prompt the choice is uploaded right away and recorded in history as `#i file`. Target output that arrives while the picker is open is held back and shown when it closes.
 
 Any other `#` line (`#s`, `# 42`) goes to the target unchanged.
 

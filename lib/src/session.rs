@@ -4,6 +4,7 @@ use crate::ctl::{self, Cmd, Req};
 use crate::edit::{Action, Editor, History};
 use crate::keys::{self, Keys};
 use crate::link::Target;
+use crate::picker::{self, Pick, Picker};
 use crate::vm::Vm;
 use anyhow::{bail, Context, Result};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent};
@@ -39,7 +40,8 @@ line editing: up/down ctrl-r ctrl-a/e/k/u/w/y alt-b/f
 after Enter keys go raw to the target until it prompts
 ctrl-c/Esc during an upload aborts it; while the target runs a line they
 are forwarded, and without a prompt within 0.5 s you get the editor back
-#i file  #r file  #e [file]  #f forth";
+#i file  #r file  #e [file]  #f forth
+Tab at the upload prompt or after #i/#r/#e opens a file picker";
 
 const GIVE_UP: Duration = Duration::from_millis(500);
 
@@ -69,6 +71,28 @@ pub fn parse_hash(line: &str) -> Hash {
         ("#e" | "#edit", false) => Hash::Edit(Some(arg.into())),
         ("#f", false) => Hash::Forth(arg.into()),
         _ => Hash::Pass,
+    }
+}
+
+/// What a picker choice is used for.
+#[derive(Debug, Clone, PartialEq)]
+enum PickFor {
+    /// Upload the file right away.
+    Upload,
+    /// Fill in the argument of a `#` directive, after this prefix.
+    Arg(String),
+}
+
+/// Whether Tab on this line opens the picker, and with which initial query.
+fn pick_target(kind: LineKind, line: &str) -> Option<(PickFor, String)> {
+    match kind {
+        LineKind::Upload => Some((PickFor::Upload, line.trim().to_string())),
+        LineKind::Target => {
+            let (word, arg) = line.split_once(' ')?;
+            let file_arg = ["#i", "#include", "#r", "#require", "#e", "#edit"].contains(&word);
+            file_arg.then(|| (PickFor::Arg(format!("{word} ")), arg.trim().to_string()))
+        }
+        LineKind::Forth => None,
     }
 }
 
@@ -185,6 +209,8 @@ pub struct Session {
     ed: Editor,
     hist: History,
     watch: Vec<u8>,
+    picker: Option<(Picker, PickFor)>,
+    held: Vec<u8>,
     give_up: Option<Instant>,
     later: VecDeque<Ev>,
     next_try: Instant,
@@ -214,6 +240,8 @@ pub fn run(vm: Vm, sock: &Path) -> Result<()> {
         ed: Editor::default(),
         hist,
         watch: Vec::new(),
+        picker: None,
+        held: Vec::new(),
         give_up: None,
         later: VecDeque::new(),
         next_try: Instant::now(),
@@ -296,6 +324,10 @@ impl Session {
     }
 
     fn serial(&mut self, b: &[u8]) {
+        if self.picker.is_some() {
+            self.held.extend_from_slice(b);
+            return;
+        }
         let visible = self.line_visible();
         self.hide_line();
         show(&mut self.out, b);
@@ -329,6 +361,11 @@ impl Session {
     }
 
     fn note(&mut self, msg: &str) {
+        if self.picker.is_some() {
+            self.held
+                .extend_from_slice(format!("\n[fterm] {msg}\n").as_bytes());
+            return;
+        }
         self.hide_line();
         show(
             &mut self.out,
@@ -411,6 +448,9 @@ impl Session {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        if self.picker.is_some() {
+            return self.picker_key(k);
+        }
         if std::mem::take(&mut self.esc) {
             return self.escape_key(k);
         }
@@ -434,6 +474,84 @@ impl Session {
         }
     }
 
+    fn open_picker(&mut self, target: PickFor, query: &str) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut roots = vec![cwd.clone()];
+        roots.extend(self.vm.settings.path.iter().cloned());
+        let items = picker::collect(&roots, &cwd);
+        if items.is_empty() {
+            return self
+                .note("no Forth files (.fs .fth .4th .f .forth) below the working dir or path");
+        }
+        if let Err(e) = execute!(self.out, terminal::EnterAlternateScreen) {
+            return self.note(&format!("picker: {e}"));
+        }
+        let title = if target == PickFor::Upload {
+            "upload"
+        } else {
+            "file"
+        };
+        self.picker = Some((Picker::new(title, items, query), target));
+        self.draw_picker();
+    }
+
+    fn picker_rows() -> (usize, usize) {
+        let (w, h) = terminal::size().unwrap_or((80, 24));
+        (w as usize, h as usize)
+    }
+
+    fn draw_picker(&mut self) {
+        let (w, h) = Self::picker_rows();
+        let Some((p, _)) = &self.picker else { return };
+        let preview = p.selected().and_then(|f| {
+            let text = std::fs::read_to_string(self.vm.resolve(Path::new(f))).ok()?;
+            Some(text.lines().take(h).collect::<Vec<_>>().join("\n"))
+        });
+        let frame = p.render(w, h, preview.as_deref());
+        self.echo(&frame);
+    }
+
+    fn picker_key(&mut self, k: KeyEvent) {
+        let (_, h) = Self::picker_rows();
+        let Some((p, _)) = self.picker.as_mut() else {
+            return;
+        };
+        match p.key(&k, h.saturating_sub(2)) {
+            Pick::Redraw => self.draw_picker(),
+            Pick::Done(choice) => {
+                let (_, target) = self.picker.take().expect("picker open");
+                if let Err(e) = execute!(self.out, terminal::LeaveAlternateScreen) {
+                    self.note(&format!("picker: {e}"));
+                }
+                let held = std::mem::take(&mut self.held);
+                if !held.is_empty() {
+                    self.serial(&held);
+                }
+                self.picked(target, choice);
+            }
+        }
+    }
+
+    fn picked(&mut self, target: PickFor, choice: Option<String>) {
+        match (target, choice) {
+            (PickFor::Upload, Some(f)) => {
+                self.echo("\r\x1b[K");
+                self.kind = LineKind::Target;
+                self.ed.clear();
+                if let Err(e) = self.hist.push(&format!("#i {f}")) {
+                    self.note(&format!("history: {e}"));
+                }
+                self.upload(Path::new(&f));
+            }
+            (PickFor::Arg(prefix), Some(f)) => {
+                self.ed.clear();
+                self.ed.insert(&format!("{prefix}{f}"));
+                self.draw_line();
+            }
+            (_, None) => self.draw_line(),
+        }
+    }
+
     fn check_give_up(&mut self) {
         let due = self.give_up.is_some_and(|d| Instant::now() >= d);
         if !due {
@@ -447,6 +565,11 @@ impl Session {
     }
 
     fn edit_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Tab {
+            if let Some((target, query)) = pick_target(self.kind, &self.ed.line()) {
+                return self.open_picker(target, &query);
+            }
+        }
         match self.ed.key(&k, &self.hist) {
             Action::Redraw => self.draw_line(),
             Action::Submit(line) => self.submit(line),
@@ -656,6 +779,22 @@ fn spawn_reader(mut port: Box<dyn SerialPort>, tx: Sender<Ev>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_target_cases() {
+        let up = |q: &str| Some((PickFor::Upload, q.to_string()));
+        let arg = |p: &str, q: &str| Some((PickFor::Arg(p.to_string()), q.to_string()));
+        assert_eq!(pick_target(LineKind::Upload, " dcf "), up("dcf"));
+        assert_eq!(pick_target(LineKind::Target, "#r dcf"), arg("#r ", "dcf"));
+        assert_eq!(
+            pick_target(LineKind::Target, "#include "),
+            arg("#include ", "")
+        );
+        assert_eq!(pick_target(LineKind::Target, "#r"), None);
+        assert_eq!(pick_target(LineKind::Target, "#f 1 2"), None);
+        assert_eq!(pick_target(LineKind::Target, "words"), None);
+        assert_eq!(pick_target(LineKind::Forth, "x"), None);
+    }
 
     #[test]
     fn parse_hash_cases() {
